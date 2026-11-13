@@ -1,0 +1,8 @@
+# Secrets — never commit
+creds.json
+config.env
+out/
+*.err
+
+# Build artifacts
+*.zip

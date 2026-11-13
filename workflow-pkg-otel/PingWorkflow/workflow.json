@@ -1,0 +1,35 @@
+{
+  "definition": {
+    "$schema": "https://schema.management.azure.com/providers/Microsoft.Logic/schemas/2016-06-01/workflowdefinition.json#",
+    "contentVersion": "1.0.0.0",
+    "triggers": {
+      "When_a_HTTP_request_is_received": {
+        "type": "Request",
+        "kind": "Http",
+        "inputs": {
+          "schema": {
+            "type": "object",
+            "properties": { "name": { "type": "string" } }
+          }
+        }
+      }
+    },
+    "actions": {
+      "Compose_greeting": {
+        "type": "Compose",
+        "inputs": "Hello @{triggerBody()?['name']} from @{workflow()['name']} at @{utcNow()}",
+        "runAfter": {}
+      },
+      "Response": {
+        "type": "Response",
+        "kind": "Http",
+        "inputs": {
+          "statusCode": 200,
+          "body": "@outputs('Compose_greeting')"
+        },
+        "runAfter": { "Compose_greeting": ["Succeeded"] }
+      }
+    }
+  },
+  "kind": "Stateful"
+}
