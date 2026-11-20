@@ -1,0 +1,7 @@
+{
+  "_comment": "Copy to creds.json (git-ignored) and fill in. Only dt_query.sh needs this; the core instrument/verify flow uses config.env instead.",
+  "credentials": {
+    "dtTenantId": "<your-environment-id, e.g. abc12345>",
+    "dtPlatformToken": "<dt0s16... platform token with DQL/Grail execute scope, for dt_query.sh>"
+  }
+}
