@@ -25,14 +25,18 @@ source config.env
 # 2. (optional) Provision throwaway Windows Logic App Standard targets.
 ./provision_testbed.sh                 # creates N apps on a WS1 plan + storage
 
-# 3. Discover eligible targets across all visible subscriptions.
+# 3. Discover eligible targets (filters optional; see "Scoping filters" below).
 ./discover.sh                          # -> out/targets.json (Windows/Standard gating)
+APP_NAME_FILTER='prod-*' RG_FILTER=my-rg ./discover.sh   # scoped discovery
 
-# 4. Preview, then instrument.
+# 4. Preview, then instrument. State persists; re-running resumes (skips succeeded).
 ./instrument.sh --all --dry-run        # mutates nothing
 ./instrument.sh --all                  # set DT_* settings -> ARM site-extension -> restart -> verify
 #   or one app:
 ./instrument.sh --name <app> --rg <rg>
+#   redo / retry:
+./instrument.sh --all --force          # re-instrument even if already succeeded
+./instrument.sh --all --retry-failed   # only re-attempt previously failed targets
 
 # 5. Deploy a sample workflow + drive load, then confirm in Dynatrace.
 ./drive_load.sh <app>                  # real workflow runs (or worker root load)
@@ -52,8 +56,8 @@ Consumption Logic Apps are correctly skipped.
 | Script | Purpose |
 |---|---|
 | `provision_testbed.sh` | Create N disposable Windows Logic App Standard targets (WS1 plan + storage) |
-| `discover.sh` | Resource-Graph sweep → `out/targets.json` with eligibility flag |
-| `instrument.sh` | Per app: DT_* app settings → ARM `siteextensions` deploy → restart → verify. `--all` / `--name` / `--dry-run` / `--drive-load` |
+| `discover.sh` | Resource-Graph sweep → `out/targets.json` with eligibility flag; honors scoping filters |
+| `instrument.sh` | Per app: DT_* app settings → ARM `siteextensions` deploy → restart → verify. `--all` / `--name` / `--dry-run` / `--drive-load` / `--force` / `--retry-failed`. **Stateful + resumable** |
 | `verify.sh` | Dual-signal check: ARM `provisioningState` + Kudu `/dynatrace/api/status` + `DT_TENANT` |
 | `drive_load.sh` | Drive load via the workflow HTTP-trigger callback, or worker root |
 | `dttags_canary.sh` | Safely test a `DT_TAGS` value on one app with health monitoring + auto-rollback |
@@ -107,6 +111,38 @@ Consumption Logic Apps are correctly skipped.
   Container Apps / Kubernetes) with Operator/CNFS injection.
 
 ---
+
+## Scoping filters
+
+All filters are environment variables, combinable, and honored by `discover.sh`,
+`instrument.sh --all`, and `verify.sh --all`:
+
+| Var | Applies to | Meaning |
+|---|---|---|
+| `SUBSCRIPTION_FILTER` | discover | Comma list of subscription names/IDs (blank = all visible). `AZ_SUBSCRIPTION` still works for a single one. |
+| `RG_FILTER` | all | Comma list of resource groups |
+| `APP_NAME_FILTER` | all | Glob on the app name, e.g. `prod-*` |
+
+```bash
+SUBSCRIPTION_FILTER="Sub A,Sub B" RG_FILTER=rg1,rg2 APP_NAME_FILTER='prod-*' ./discover.sh
+APP_NAME_FILTER='prod-*' ./instrument.sh --all
+```
+
+## State & resume
+
+`instrument.sh` appends every outcome to `out/state.tsv`
+(`name ⟶ rg ⟶ sub ⟶ status ⟶ detail ⟶ timestamp`; last line per app wins; the
+file survives crashes and is never truncated).
+
+- **Resume:** re-running the same command skips apps whose last status is
+  `succeeded` — a crash mid-fleet resumes where it left off with **no redundant
+  restarts** of already-instrumented apps.
+- **`--force`** — re-instrument targets regardless of recorded state.
+- **`--retry-failed`** — only re-attempt targets whose last status was a failure
+  (`deployment_failed`, `appsettings_failed`, `verify_uncertain`, …); skips
+  succeeded/skipped/not-yet-run.
+- **Run lock:** a `flock` on `out/.instrument.lock` prevents two concurrent runs.
+- Fresh start: `rm out/state.tsv`.
 
 ## Safety
 

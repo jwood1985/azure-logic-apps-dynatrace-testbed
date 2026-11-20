@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# verify.sh — report the Dynatrace site-extension state for a Logic App.
+# verify.sh — report the Dynatrace site-extension state for Logic App(s).
 #
 # Checks two independent signals (per the azure-appservice-connection skill):
 #   1. ARM: the siteextensions/Dynatrace resource provisioningState.
@@ -10,12 +10,17 @@
 #   ./verify.sh --name dt-logicapp-test --rg josh-wood-resource-grp [--subscription X]
 #   ./verify.sh --all                 # every eligible target in out/targets.json
 #
+# Filters for --all (env vars, same as instrument.sh):
+#   APP_NAME_FILTER   glob on app name, e.g. 'prod-*'
+#   RG_FILTER         comma list of resource groups
+#
 set -uo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 OUT="$ROOT/out"
 [ -f "$ROOT/config.env" ] && { set +u; . "$ROOT/config.env"; set -u; }
 
 MODE="" NAME="" RG="" SUB="${AZ_SUBSCRIPTION:-}"
+APP_NAME_FILTER="${APP_NAME_FILTER:-}" ; RG_FILTER="${RG_FILTER:-}"
 while [ $# -gt 0 ]; do
   case "$1" in
     --all) MODE=all ;;
@@ -65,12 +70,21 @@ check_one(){
 
 if [ "$MODE" = all ]; then
   [ -f "$OUT/targets.json" ] || { echo "run ./discover.sh first" >&2; exit 1; }
-  while IFS='|' read -r n r s; do check_one "$n" "$r" "$s"; done < <(python3 - "$OUT/targets.json" <<'PY'
-import json,sys
+  FOUND=0
+  while IFS='|' read -r n r s; do
+    [ -z "$n" ] && continue
+    FOUND=1; check_one "$n" "$r" "$s"
+  done < <(python3 - "$OUT/targets.json" "$APP_NAME_FILTER" "$RG_FILTER" <<'PY'
+import json,sys,fnmatch
+glob=sys.argv[2].strip(); rgs=[x.strip() for x in sys.argv[3].split(',') if x.strip()]
 for r in json.load(open(sys.argv[1])):
-    if r.get("eligible"): print("%s|%s|%s"%(r["name"],r["resourceGroup"],r["subscriptionId"]))
+    if not r.get("eligible"): continue
+    if glob and not fnmatch.fnmatch(r["name"], glob): continue
+    if rgs and r["resourceGroup"] not in rgs: continue
+    print("%s|%s|%s"%(r["name"],r["resourceGroup"],r["subscriptionId"]))
 PY
 )
+  [ "$FOUND" -eq 1 ] || echo "(no eligible targets after filters)"
 else
   if [ -z "$RG" ] && [ -f "$OUT/targets.json" ]; then
     RESOLVED=$(python3 - "$OUT/targets.json" "$NAME" <<'PY'
@@ -81,5 +95,6 @@ PY
 )
     RG="${RESOLVED%%|*}"; [ -z "$SUB" ] && SUB="${RESOLVED##*|}"
   fi
+  [ -n "$RG" ] || { echo "could not resolve resource group for '$NAME' — pass --rg" >&2; exit 1; }
   check_one "$NAME" "$RG" "$SUB"
 fi
