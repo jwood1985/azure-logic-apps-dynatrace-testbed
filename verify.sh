@@ -32,12 +32,21 @@ while [ $# -gt 0 ]; do
 done
 [ -n "$MODE" ] || { echo "specify --all or --name <logicapp>" >&2; exit 2; }
 
+# Validate the subscription up front — a bogus value would be misreported as
+# "extension NOT present" on every app.
+if [ -n "$SUB" ]; then
+  az account show --subscription "$SUB" --query id -o tsv >/dev/null 2>&1 || {
+    echo "ERROR: cannot resolve subscription '$SUB' (from --subscription/AZ_SUBSCRIPTION/config.env)." >&2
+    echo "       Use the full subscription name or ID, or leave AZ_SUBSCRIPTION blank." >&2
+    exit 1; }
+fi
+
 check_one(){
   local name="$1" rg="$2" sub="$3"
   local sub_args=(); [ -n "$sub" ] && sub_args=(--subscription "$sub")
   local sub_id; sub_id=$(az account show "${sub_args[@]}" --query id -o tsv 2>/dev/null)
 
-  echo "── $name (rg=$rg)"
+  echo "-- $name (rg=$rg)"
 
   # 1. ARM provisioningState.
   local url="/subscriptions/${sub_id}/resourceGroups/${rg}/providers/Microsoft.Web/sites/${name}/siteextensions/Dynatrace?api-version=2023-01-01"

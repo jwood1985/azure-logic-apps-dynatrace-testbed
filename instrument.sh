@@ -59,11 +59,21 @@ fail(){ echo "ERROR: $*" >&2; exit 1; }
 if [ "$DRY" -eq 0 ]; then
   : "${DT_TENANT:?set DT_TENANT (source config.env)}"
   : "${DT_API_TOKEN:?set DT_API_TOKEN (source config.env)}"
+  case "$DT_TENANT$DT_API_TOKEN" in *REPLACE_ME*)
+    fail "config.env still has REPLACE_ME placeholders — edit DT_TENANT and DT_API_TOKEN with your real values first" ;;
+  esac
 fi
 DT_SSL_MODE="${DT_SSL_MODE:-default}"
 DT_MONITORED_CLR="${DT_MONITORED_CLR:-both}"
 command -v az >/dev/null || fail "az CLI not found"
 az account show >/dev/null 2>&1 || fail "not logged in: run 'az login'"
+
+# Validate the subscription up front — a bogus value (e.g. a partial name) makes
+# every az call fail and would otherwise be misreported as "site not found".
+if [ -n "$SUB" ]; then
+  az account show --subscription "$SUB" --query id -o tsv >/dev/null 2>&1 || \
+    fail "cannot resolve subscription '$SUB' (from --subscription/AZ_SUBSCRIPTION/config.env). Use the full subscription name or ID, or leave AZ_SUBSCRIPTION blank. 'az account list -o table' shows what you can access."
+fi
 
 # ---- run lock (prevent concurrent runs) -------------------------------------
 LOCK="$OUT/.instrument.lock"
@@ -119,7 +129,7 @@ instrument_one(){
   local sub_args=(); [ -n "$sub" ] && sub_args=(--subscription "$sub")
   local status="unknown" detail=""
 
-  echo "────────────────────────────────────────────────────────────"
+  echo "------------------------------------------------------------"
   echo ">> $name  (rg=$rg sub=${sub:-current})"
 
   local kind reserved state
@@ -170,7 +180,7 @@ instrument_one(){
   [ -z "$ext_state" ] && ext_state="$prov"
 
   if [ "$ext_state" = "Succeeded" ] || [ "$prov" = "Succeeded" ]; then
-    echo "   ✓ $name instrumented (extension state=$ext_state)"; status="succeeded"; detail="$ext_state"
+    echo "   [OK] $name instrumented (extension state=$ext_state)"; status="succeeded"; detail="$ext_state"
   else
     echo "   ? $name: extension state=$ext_state (see $OUT/$name.deployment.json)"; status="verify_uncertain"; detail="$ext_state"
   fi
@@ -204,7 +214,7 @@ done
 
 # ---- summary (from persistent state, for this run's candidates) -------------
 echo
-echo "════════════════════════════ SUMMARY ════════════════════════════"
+echo "============================ SUMMARY ============================"
 python3 - "$STATE" "$(printf '%s\n' "${TARGETS[@]}")" <<'PY'
 import sys
 state={}

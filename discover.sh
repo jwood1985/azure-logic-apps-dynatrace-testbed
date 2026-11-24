@@ -45,6 +45,15 @@ if [ -n "$SUB_FILTER" ]; then
   [ ${#ids[@]} -gt 0 ] && GRAPH_ARGS=(--subscriptions "${ids[@]}")
 fi
 
+# `az graph` needs the resource-graph extension; install it non-interactively
+# so fresh customer machines don't hang on a prompt.
+if ! az extension show --name resource-graph >/dev/null 2>&1; then
+  echo "==> installing az 'resource-graph' extension (one-time)" >&2
+  az extension add --name resource-graph --only-show-errors 2>/dev/null \
+    || az config set extension.use_dynamic_install=yes_without_prompt --only-show-errors 2>/dev/null \
+    || true
+fi
+
 QUERY="Resources
 | where type =~ 'Microsoft.Web/sites' and kind contains 'workflowapp'
 | extend reserved = tobool(properties.reserved)
