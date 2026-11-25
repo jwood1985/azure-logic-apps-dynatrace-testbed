@@ -23,6 +23,24 @@
 # OTHER
 #   --dry-run       validate + print plan, change nothing
 #   --drive-load    after instrument, ping the app to generate monitored load
+#   --parallel N    instrument N apps concurrently (default 1)
+#
+# COMPLETION
+#   A run only reports "succeeded" once the OneAgent binary is actually
+#   installed (Kudu /dynatrace/api/status -> state=Installed,
+#   isAgentInstalled=true). ARM "Succeeded" alone just means the extension
+#   RESOURCE exists while the agent is still downloading.
+#   Tune the wait with AGENT_WAIT_TRIES (default 40) x AGENT_WAIT_SLEEP (15s).
+#
+# CONCURRENCY NOTES
+#   Safe to run N apps in parallel: state appends are flock-serialized, the
+#   generated template is per-process, per-app artifacts are name-keyed, and
+#   ARM deployment names are unique per app. Output is buffered per app and
+#   printed atomically. A global run lock still prevents two separate
+#   invocations from racing.
+#   CAUTION: apps sharing one App Service Plan share Kudu/SCM compute, and
+#   concurrent site-extension installs on the same plan can contend on file
+#   locks. Prefer --parallel 1 within a plan, or parallelize across plans.
 #
 set -uo pipefail
 
@@ -36,6 +54,7 @@ STATE="$OUT/state.tsv"            # persistent, append-only (last line per app w
 
 # ---- args -------------------------------------------------------------------
 MODE="" ; NAME="" ; RG="" ; SUB="${AZ_SUBSCRIPTION:-}" ; DRY=0 ; DRIVE=0 ; FORCE=0 ; RETRY_FAILED=0
+PARALLEL="${PARALLEL:-1}"
 APP_NAME_FILTER="${APP_NAME_FILTER:-}" ; RG_FILTER="${RG_FILTER:-}"
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -47,6 +66,7 @@ while [ $# -gt 0 ]; do
     --drive-load)   DRIVE=1 ;;
     --force)        FORCE=1 ;;
     --retry-failed) RETRY_FAILED=1 ;;
+    --parallel)     PARALLEL="${2:-1}"; shift ;;
     -h|--help)      grep '^#' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) echo "unknown arg: $1" >&2; exit 2 ;;
   esac
@@ -73,7 +93,8 @@ if [ -n "${TEMPLATE_OVERRIDE:-}" ]; then
   fi
   grep -q "logicAppName" "$TEMPLATE" || fail "$TEMPLATE does not define the 'logicAppName' parameter this tool passes."
 else
-  TEMPLATE="$OUT/.siteextension.generated.json"
+  # Per-process filename: safe if several runs/workers share $OUT.
+  TEMPLATE="$OUT/.siteextension.$$.json"
   cat > "$TEMPLATE" <<'ARMJSON'
 {
   "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
@@ -124,8 +145,12 @@ fi
 # ---- persistent state (append-only; last line per app wins) -----------------
 touch "$STATE"
 state_status(){ awk -F'\t' -v n="$1" '$1==n{s=$4} END{print s}' "$STATE" 2>/dev/null; }
+# Appends are serialized with flock so parallel workers can't interleave a line.
 state_set(){ # name rg sub status detail
-  printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$1" "$2" "$3" "$4" "$5" "$(date -u +%FT%TZ)" >> "$STATE"; }
+  local line
+  line=$(printf '%s\t%s\t%s\t%s\t%s\t%s' "$1" "$2" "$3" "$4" "$5" "$(date -u +%FT%TZ)")
+  ( flock 8; printf '%s\n' "$line" >> "$STATE" ) 8>"$OUT/.state.lock"
+}
 
 # ---- build the work list ----------------------------------------------------
 declare -a TARGETS=()
@@ -158,7 +183,13 @@ PY
   TARGETS+=("$NAME|$RG|${SUB}")
 fi
 
-echo "==> ${#TARGETS[@]} candidate target(s); dry-run=$DRY force=$FORCE retry-failed=$RETRY_FAILED drive-load=$DRIVE"
+echo "==> ${#TARGETS[@]} candidate target(s); dry-run=$DRY force=$FORCE retry-failed=$RETRY_FAILED drive-load=$DRIVE parallel=$PARALLEL"
+if [ "$PARALLEL" -gt 1 ]; then
+  # Same-plan concurrency can contend on Kudu file locks during extension install.
+  PLANS=$(printf '%s\n' "${TARGETS[@]}" | cut -d'|' -f2 | sort -u | wc -l)
+  echo "    NOTE: parallel mode — apps sharing an App Service Plan can contend on Kudu"
+  echo "          file locks during install. Use --parallel 1 if you see failures."
+fi
 echo "    script:     ${BASH_SOURCE[0]}"
 if [ -n "$SUB" ]; then
   echo "    subscription: $SUB (explicit)"
@@ -231,21 +262,69 @@ instrument_one(){
   prov=$(python3 -c "import json;print(json.load(open('$OUT/$name.deployment.json'))['properties']['provisioningState'])" 2>/dev/null || echo "?")
   echo "        deployment provisioningState=$prov"
 
-  echo "   [3/4] restarting app"
+  echo "   [3/5] restarting app"
   az webapp restart "${sub_args[@]}" -g "$rg" -n "$name" --output none 2>/dev/null || echo "        (restart non-zero — continuing)"
 
-  echo "   [4/4] verifying site extension"
+  echo "   [4/5] verifying site extension resource (ARM)"
   local sub_id; sub_id=$(az account show "${sub_args[@]}" --query id -o tsv 2>/dev/null)
   local ext_url="/subscriptions/${sub_id}/resourceGroups/${rg}/providers/Microsoft.Web/sites/${name}/siteextensions/${EXT_NAME}?api-version=2023-01-01"
   local ext_json ext_state
   ext_json=$(az rest --method GET --url "$ext_url" 2>/dev/null || true)
   ext_state=$(printf '%s' "$ext_json" | grep -oP '"provisioningState"\s*:\s*"\K[^"]+' | head -1 || true)
   [ -z "$ext_state" ] && ext_state="$prov"
+  echo "        extension resource state=$ext_state"
 
-  if [ "$ext_state" = "Succeeded" ] || [ "$prov" = "Succeeded" ]; then
-    echo "   [OK] $name instrumented (extension state=$ext_state)"; status="succeeded"; detail="$ext_state"
+  # [5/5] ARM "Succeeded" only means the extension RESOURCE exists. The OneAgent
+  # binary is downloaded/installed asynchronously afterwards (Kudu shows
+  # "Downloading the agent… N%"). Poll the extension's own status endpoint until
+  # the agent is really installed before declaring success.
+  echo "   [5/5] waiting for OneAgent download/install to finish (Kudu)"
+  local host scm tok kudu_code agent_state agent_installed agent_ver
+  host=$(az webapp show "${sub_args[@]}" -g "$rg" -n "$name" --query defaultHostName -o tsv 2>/dev/null)
+  scm="https://${host/.azurewebsites.net/.scm.azurewebsites.net}"
+  tok=$(az account get-access-token "${sub_args[@]}" --resource "https://management.azure.com" --query accessToken -o tsv 2>/dev/null | tr -d '\r')
+  agent_state=""; agent_installed=""; agent_ver=""
+  local tries="${AGENT_WAIT_TRIES:-40}" nap="${AGENT_WAIT_SLEEP:-15}" i
+  for i in $(seq 1 "$tries"); do
+    kudu_code=$(curl -s -o "$OUT/$name.kudu.json" -w '%{http_code}' --max-time 25 \
+                 -H "Authorization: Bearer $tok" "$scm/dynatrace/api/status" 2>/dev/null || echo 000)
+    if [ "$kudu_code" = "200" ]; then
+      read -r agent_state agent_installed agent_ver < <(python3 -c "
+import json
+try:
+    d=json.load(open('$OUT/$name.kudu.json'))
+    print(d.get('state','?'), d.get('isAgentInstalled',False), d.get('version','?'))
+except Exception: print('? False ?')" 2>/dev/null)
+      if [ "$agent_state" = "Installed" ] && [ "$agent_installed" = "True" ]; then
+        echo "        agent INSTALLED (version $agent_ver) after $((i*nap))s"; break
+      fi
+      echo "        agent state=$agent_state installed=$agent_installed (${i}/${tries}, $((i*nap))s elapsed)"
+    elif [ "$kudu_code" = "403" ]; then
+      echo "        Kudu 403 (SCM network-blocked) — cannot confirm agent install; relying on ARM state"
+      agent_state="kudu_blocked"; break
+    elif [ "$i" -eq 1 ]; then
+      echo "        Kudu HTTP $kudu_code (app may still be restarting) — retrying"
+    fi
+    sleep "$nap"
+  done
+
+  if [ "$agent_state" = "Installed" ] && [ "$agent_installed" = "True" ]; then
+    echo "   [OK] $name fully instrumented (agent $agent_ver, extension=$ext_state)"
+    status="succeeded"; detail="agent $agent_ver"
+  elif [ "$agent_state" = "kudu_blocked" ]; then
+    if [ "$ext_state" = "Succeeded" ]; then
+      echo "   [~] $name extension deployed but agent install UNVERIFIED (Kudu blocked)"
+      status="succeeded_unverified"; detail="$ext_state/kudu_blocked"
+    else
+      status="verify_uncertain"; detail="$ext_state/kudu_blocked"
+    fi
+  elif [ "$ext_state" = "Succeeded" ]; then
+    echo "   [!] $name: extension deployed but agent still '$agent_state' after $((tries*nap))s"
+    echo "       Not fatal — the download can continue. Re-run ./verify.sh later, or raise AGENT_WAIT_TRIES."
+    status="agent_install_timeout"; detail="state=$agent_state"
   else
-    echo "   ? $name: extension state=$ext_state (see $OUT/$name.deployment.json)"; status="verify_uncertain"; detail="$ext_state"
+    echo "   ? $name: extension state=$ext_state (see $OUT/$name.deployment.json)"
+    status="verify_uncertain"; detail="$ext_state"
   fi
 
   if [ "$DRIVE" -eq 1 ]; then
@@ -258,8 +337,22 @@ instrument_one(){
   state_set "$name" "$rg" "$sub" "$status" "$detail"
 }
 
-# ---- main loop with resume/skip ---------------------------------------------
+# ---- main loop with resume/skip (optionally parallel) -----------------------
+# In parallel mode each worker buffers its output to a per-app log and prints it
+# atomically (flock) when done, so apps' output never interleaves.
+run_job(){
+  local n="$1" r="$2" s="$3"
+  if [ "$PARALLEL" -le 1 ]; then
+    instrument_one "$n" "$r" "$s"
+  else
+    local log="$OUT/$n.run.log"
+    instrument_one "$n" "$r" "$s" >"$log" 2>&1
+    ( flock 7; cat "$log" ) 7>"$OUT/.print.lock"
+  fi
+}
+
 declare -a RAN=()
+running=0
 for t in "${TARGETS[@]}"; do
   IFS='|' read -r n r s <<<"$t"
   st="$(state_status "$n")"
@@ -271,9 +364,19 @@ for t in "${TARGETS[@]}"; do
       ""|succeeded|skip_*|dry_run) echo ">> $n — retry-failed: last='${st:-none}', skipping"; continue ;;
     esac
   fi
-  instrument_one "$n" "$r" "$s"
+  if [ "$PARALLEL" -le 1 ]; then
+    run_job "$n" "$r" "$s"
+  else
+    run_job "$n" "$r" "$s" &
+    running=$((running+1))
+    if [ "$running" -ge "$PARALLEL" ]; then
+      wait -n 2>/dev/null || wait
+      running=$((running-1))
+    fi
+  fi
   RAN+=("$n")
 done
+[ "$PARALLEL" -gt 1 ] && wait
 
 # ---- summary (from persistent state, for this run's candidates) -------------
 echo

@@ -37,6 +37,7 @@ APP_NAME_FILTER='prod-*' RG_FILTER=my-rg ./discover.sh   # scoped discovery
 #   redo / retry:
 ./instrument.sh --all --force          # re-instrument even if already succeeded
 ./instrument.sh --all --retry-failed   # only re-attempt previously failed targets
+./instrument.sh --all --parallel 4     # instrument 4 apps concurrently
 
 # 5. Deploy a sample workflow + drive load, then confirm in Dynatrace.
 ./drive_load.sh <app>                  # real workflow runs (or worker root load)
@@ -143,6 +144,40 @@ file survives crashes and is never truncated).
   succeeded/skipped/not-yet-run.
 - **Run lock:** a `flock` on `out/.instrument.lock` prevents two concurrent runs.
 - Fresh start: `rm out/state.tsv`.
+
+## Completion semantics (when is it really done?)
+
+ARM reporting `provisioningState=Succeeded` only means the **extension resource
+exists** — the OneAgent binary is still downloading (Kudu shows *"Downloading
+the agent… N%"*). `instrument.sh` therefore polls the extension's own status
+endpoint (`{scm}/dynatrace/api/status`) and only records **`succeeded`** once
+`state=Installed` **and** `isAgentInstalled=true`, logging the agent version.
+
+| Recorded status | Meaning |
+|---|---|
+| `succeeded` | Agent binary confirmed installed |
+| `agent_install_timeout` | Extension deployed, agent still downloading when the wait expired (not fatal — re-run `verify.sh`, or raise the wait) |
+| `succeeded_unverified` | Extension deployed, but Kudu/SCM is network-blocked (403) so the agent couldn't be confirmed |
+
+Tune the wait: `AGENT_WAIT_TRIES` (default 40) × `AGENT_WAIT_SLEEP` (default 15s)
+≈ 10 minutes.
+
+## Parallelism
+
+```bash
+./instrument.sh --all --parallel 4
+```
+
+Safe by design: state appends are `flock`-serialized, the generated ARM template
+is per-process, per-app artifacts are name-keyed, ARM deployment names are
+unique per app, and each app's output is buffered and printed atomically so logs
+never interleave. A global run lock still prevents two separate invocations from
+racing.
+
+**Caution:** apps sharing one **App Service Plan** share Kudu/SCM compute, and
+concurrent site-extension installs on the same plan can contend on file locks
+(`UnauthorizedAccessException`). Prefer `--parallel 1` within a plan, or
+parallelize across plans (e.g. one run per `RG_FILTER`).
 
 ## Safety
 
