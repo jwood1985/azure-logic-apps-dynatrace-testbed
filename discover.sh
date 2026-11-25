@@ -65,7 +65,36 @@ QUERY="Resources
           eligible
 | order by name asc"
 
-az graph query -q "$QUERY" "${GRAPH_ARGS[@]}" --query "data" -o json > "$OUT/targets.raw.json"
+# Paginate: az graph query returns only 100 rows by default. Request pages of
+# 1000 (the max) and follow skip tokens until exhausted, so large fleets aren't
+# silently truncated.
+: > "$OUT/targets.pages.jsonl"
+SKIP_TOKEN=""
+PAGES=0
+while :; do
+  PAGE_ARGS=(--first 1000)
+  [ -n "$SKIP_TOKEN" ] && PAGE_ARGS+=(--skip-token "$SKIP_TOKEN")
+  RESP=$(az graph query -q "$QUERY" "${GRAPH_ARGS[@]}" "${PAGE_ARGS[@]}" -o json)
+  SKIP_TOKEN=$(printf '%s' "$RESP" | python3 -c "import sys,json
+d=json.load(sys.stdin)
+json.dump(d.get('data',[]), open('$OUT/targets.page.json','w'))
+print(d.get('skip_token') or '')")
+  cat "$OUT/targets.page.json" >> "$OUT/targets.pages.jsonl"; echo >> "$OUT/targets.pages.jsonl"
+  PAGES=$((PAGES+1))
+  [ -z "$SKIP_TOKEN" ] && break
+  echo "    ...page $PAGES fetched, continuing" >&2
+done
+
+# Merge pages into one array.
+python3 - "$OUT/targets.pages.jsonl" "$OUT/targets.raw.json" <<'PY'
+import json, sys
+rows = []
+for line in open(sys.argv[1]):
+    line = line.strip()
+    if line: rows.extend(json.loads(line))
+json.dump(rows, open(sys.argv[2], "w"))
+PY
+rm -f "$OUT/targets.pages.jsonl" "$OUT/targets.page.json"
 
 # Post-filter by RG list + name glob, write the final manifest.
 python3 - "$OUT/targets.raw.json" "$OUT/targets.json" "$RG_FILTER" "$APP_NAME_FILTER" <<'PY'

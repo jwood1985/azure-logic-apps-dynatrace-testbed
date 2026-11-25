@@ -136,7 +136,25 @@ instrument_one(){
   kind=$(az resource show "${sub_args[@]}" -g "$rg" -n "$name" \
           --resource-type Microsoft.Web/sites --query kind -o tsv 2>/dev/null || true)
   if [ -z "$kind" ]; then
-    echo "   !! site not found via ARM — skipping"; state_set "$name" "$rg" "$sub" "not_found" ""; return; fi
+    # Diagnose instead of a bare "not found": wrong subscription, Consumption
+    # flavor, or a name typo all land here and need different fixes.
+    local cur_sub; cur_sub=$(az account show "${sub_args[@]}" --query "[name,id]" -o tsv 2>/dev/null | paste -sd' | ' -)
+    echo "   !! site not found via ARM (searched subscription: ${cur_sub:-unknown})"
+    if ! az group show "${sub_args[@]}" -n "$rg" >/dev/null 2>&1; then
+      echo "      -> resource group '$rg' does not exist in that subscription."
+      echo "         Wrong subscription? Pass --subscription <name|id> (or set AZ_SUBSCRIPTION in config.env)."
+      echo "         'az account list -o table' shows your subscriptions."
+      state_set "$name" "$rg" "$sub" "not_found_rg" ""; return
+    fi
+    if az resource show "${sub_args[@]}" -g "$rg" -n "$name" --resource-type Microsoft.Logic/workflows >/dev/null 2>&1; then
+      echo "      -> '$name' exists but is a CONSUMPTION Logic App (Microsoft.Logic/workflows)."
+      echo "         Consumption has no Kudu/site extensions — the OneAgent site extension cannot be installed."
+      echo "         Only Logic App STANDARD (Microsoft.Web/sites, Windows) is instrumentable this way."
+      state_set "$name" "$rg" "$sub" "skip_consumption" ""; return
+    fi
+    echo "      -> RG exists but has no site named '$name'. Check the exact name:"
+    echo "         az resource list -g $rg --query \"[?contains(type,'Web/sites') || contains(type,'Logic')].{name:name,type:type}\" -o table"
+    state_set "$name" "$rg" "$sub" "not_found" ""; return; fi
   reserved=$(az webapp show "${sub_args[@]}" -g "$rg" -n "$name" --query reserved -o tsv 2>/dev/null || true)
   state=$(az webapp show "${sub_args[@]}" -g "$rg" -n "$name" --query state -o tsv 2>/dev/null || true)
   echo "   kind=$kind os=$([ "$reserved" = "true" ] && echo Linux || echo Windows) state=$state"
