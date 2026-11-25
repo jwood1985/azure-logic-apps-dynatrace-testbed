@@ -120,6 +120,12 @@ PY
 fi
 
 echo "==> ${#TARGETS[@]} candidate target(s); dry-run=$DRY force=$FORCE retry-failed=$RETRY_FAILED drive-load=$DRIVE"
+echo "    script:     ${BASH_SOURCE[0]}"
+if [ -n "$SUB" ]; then
+  echo "    subscription: $SUB (explicit)"
+else
+  echo "    subscription: $(az account show --query 'name' -o tsv 2>/dev/null) / $(az account show --query id -o tsv 2>/dev/null) (az DEFAULT — pass --subscription or set AZ_SUBSCRIPTION to override)"
+fi
 echo "    state file: $STATE"
 echo
 
