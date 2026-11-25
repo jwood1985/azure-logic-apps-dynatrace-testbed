@@ -56,6 +56,20 @@ done
 fail(){ echo "ERROR: $*" >&2; exit 1; }
 [ -n "$MODE" ] || fail "specify --all or --name <logicapp>"
 [ -f "$TEMPLATE" ] || fail "missing template: $TEMPLATE"
+
+# Template preflight. This tool requires the MINIMAL site-extension template,
+# which only adds Microsoft.Web/sites/siteextensions to an EXISTING app.
+# Dynatrace's published full-stack template takes different parameters and also
+# declares Microsoft.Web/serverfarms + a full Microsoft.Web/sites resource —
+# deploying that against an existing Logic App can move it onto a new (default
+# B1) plan and REPLACE its entire appSettings array. Refuse to run it.
+if grep -qiE '"type"[[:space:]]*:[[:space:]]*"Microsoft\.Web/serverfarms"' "$TEMPLATE"; then
+  fail "$TEMPLATE declares a Microsoft.Web/serverfarms resource — that is Dynatrace's FULL-STACK template, not the minimal site-extension template this tool needs.
+       Deploying it against an existing Logic App can move the app to a new App Service plan and overwrite its app settings. Aborting.
+       Restore the repo's template:  git checkout -- templates/dynatrace-oneagent-siteextension.json"
+fi
+grep -q "logicAppName" "$TEMPLATE" || fail "$TEMPLATE does not define the 'logicAppName' parameter this tool passes.
+       You are using a different template. Restore the repo's one:  git checkout -- templates/dynatrace-oneagent-siteextension.json"
 if [ "$DRY" -eq 0 ]; then
   : "${DT_TENANT:?set DT_TENANT (source config.env)}"
   : "${DT_API_TOKEN:?set DT_API_TOKEN (source config.env)}"
